@@ -12,6 +12,9 @@
 
 ###TODO read from webmap
 ###TODO handle multiple incident features
+###TODO handle non-url based layers....keep in mind that non-url based layers don't support where based queries...only extent queries
+###TODO handle cases where request or response are large
+##TODO get popup and tags
 
 
 import arcpy, urllib, json, datetime, time, logging, datetime, os, sys, traceback, gzip, email.generator, mimetypes, shutil, io
@@ -29,20 +32,6 @@ except ImportError:
     from urllib import urlencode as encode
     import ConfigParser as configparser
     from cStringIO import StringIO
-
-
-######## user variables ###########
-source_map_id = ""
-user = ""
-password = ""
-share_group = ""
-time_interval = ""
-incident_layer = ""
-incident_fids = []
-analysis_layers = []
-base_map = ""
-map_extent = ""
-
 
 class _MultiPartForm(object):
     """Accumulate the data to be used when posting a form."""
@@ -161,77 +150,40 @@ class _MultiPartForm(object):
         textwriter.write('--{}--\r\n\r\n'.format(boundary))
         self.form_data = buf.getvalue()
 
-class OptionObject:
-    def __init__(self, name, data, shareWith, folderOptions, mapExtent, mapTitle):
-        self.name = name
-        self.data = data
-        self.shareWith = shareWith
-        self.folderOptions = folderOptions
-        self.mapExtent = mapExtent
-        self.mapTitle = mapTitle 
-    def name(self):
-        return self.name
-    def data(self):
-        self.data
-    def shareWith(self):
-        return self.shareWith
-    def folderOptions(self):
-        return self.folderOptions
-    def mapExtent(self):
-        self.mapExtent
-    def mapTitle(self):
-        return self.mapTitle
-
 class LayerData(object):
-    def __init__(self, name, graphics, renderer, infoTemplate, 
-                 fields, tags, description, visibleOnStartup,
-                 appendTimeStamp, typeIdField, types, minScale, maxScale, geometryType, type):
-        self.name = name
-        self.graphics = graphics
-        self.renderer = renderer
-        self.infoTemplate = infoTemplate
-        self.fields = fields
-        self.tags = tags
-        self.description = description
+    def __init__(self, webmap_layer, item_info, item, time, visibleOnStartup, type):
+        """Store key layer properties
+        Keyword arguments:
+        webmap_layer - operational layer from webmap
+        item_info - 
+        item - 
+        time - time snapshot started
+        visibleOnStartup - control if layer will be visible when added to the new webmap"""
+
+        #item_info properties
+        self.name = item_info['name'] + time
+        self.drawingInfo = item_info['drawingInfo']      
+        self.fields = item_info['fields']   
+        self.description = item_info['description']       
+        self.typeIdField = item_info['typeIdField']
+        self.types = item_info['types']
+        self.minScale = item_info['minScale']
+        self.maxScale = item_info['maxScale']
+        self.geometryType = item_info['geometryType']
+        self.extent = item_info['extent']
+
+        self.infoTemplate = None
+        self.tags = None
+        self.objectIdField = item['objectIdFieldName']
+        
+        #item properties
+        self.graphics = item['features']
+
+        #webmap_layer properties
+
+        #additional properties
         self.visibleOnStartup = visibleOnStartup
-        self.appendTimeStamp = appendTimeStamp
-        self.typeIdField = typeIdField
-        self.types = types
-        self.minScale = minScale
-        self.maxScale = maxScale
-        self.geometryType = geometryType
         self.type = type
-    def name(self):
-        return self.name
-    def graphics(self):
-        return self.graphics
-    def renderer(self):
-        self.renderer
-    def infoTemplate(self):
-        return self.infoTemplate
-    def fields(self):
-        return self.fields
-    def tags(self):
-        return self.tags
-    def description(self):
-        self.description
-    def visibleOnStartup(self):
-        return self.visibleOnStartup
-    def appendTimeStamp(self):
-        return self.appendTimeStamp
-    def typeIdField(self):
-        return self.typeIdField
-    def types(self):
-        self.types
-    def minScale(self):
-        return self.minScale
-    def maxScale(self):
-        return self.maxScale
-    def geomtryType(self):
-        return self.geometryType
-    #incident or analysis...poly and line incident features draw below analysis features
-    def type(self):
-        return self.type
 
 class Snapshot:
     def __init__(self):
@@ -241,8 +193,13 @@ class Snapshot:
         _time = datetime.datetime.utcnow()
         self.time = "{0}_{1}_{2}_({3}:{4} {5})".format(_time.month, _time.day, _time.year, _time.hour, _time.min, _time.second)
 
+    #TODO clean up this business
     def _share_ids(self):
         return self._share_ids
+    def time(self):
+        return self.time
+    def webmap_layers(self):
+        return self.webmap_layers
     def _base_url(self):
         return self._portal_url + 'sharing/rest/'
     def _portal_url(self):
@@ -251,15 +208,16 @@ class Snapshot:
         return '{0}/sharing/rest/content/users/{1}'.format(self._config_options['org_url'].rstrip('/'), self._config_options['username'])
     def _items_url(self):
         return '{0}/sharing/rest/content/items/'.format(self._config_options['org_url'].rstrip('/')) + "{0}"
-    def time(self):
-        return self.time
+    def _data_url(self):
+        return '{0}/sharing/rest/content/items/'.format(self._config_options['org_url'].rstrip('/')) + "{0}/Data"
 
     def create_snapshot(self, config_file):
         """Snapshot"""
         try:         
             self._read_config(config_file)
             self._config_options['token'] = self._get_token()
-            #self._create_folder()
+            self._init_webmap(self._config_options['webmap_id'])
+            self._create_folder()
             self._create_layers()
             self._create_map()
             self._add_layers_to_map()
@@ -269,8 +227,16 @@ class Snapshot:
         finally:
             self._end_logging()
 
+    def _init_webmap(self, id):
+        url = self._data_url().format(id)
+        request_parameters = {'f' : 'json', 'token' : self._config_options['token']}
+        item = self._url_request(url, request_parameters, error_text='Unable to find item with ID: {}'.format(id))
+        self.web_map = item
+        self.web_map['itemId'] = id
+        self.webmap_layers = item['operationalLayers']
+
     def _create_folder(self):
-        #create folder and add itemID to self._share_ids
+        """create folder and add itemID to self._share_ids"""
         self._log_message('Creating Folder: ' + self._config_options['folder_name'] + "_" + self.time)
 
         url = self._user_url() + '/createFolder'
@@ -284,7 +250,8 @@ class Snapshot:
 
         item = self._url_request(url, request_parameters, request_type='POST')
 
-        self._share_ids.append(item['folder']['id'])
+        self.folder_id = item['folder']['id']
+        self._share_ids.append(self.folder_id)
         self._log_message('Folder created')
 
     def _create_layers(self):
@@ -295,83 +262,81 @@ class Snapshot:
         features = incident_item.graphics
         incident_type = incident_item.geometryType
 
-        #TODO support map or comma delimited ids
+        #create incident layer
+        self._create_layer(incident_item, None, None, 'incident')
 
         #create a layer for each of the user defined layer ids
-        layer_ids = self._config_options['layer_service_ids'].split(",")
-        for id in layer_ids:
-            self._create_layer(id, features, incident_type)
+        analysis_layers = self._get_analysis_layers()
+        for layer in analysis_layers:
+            self._create_layer(layer, features, incident_type, 'analysis')
             
         print('layers created')
         self._log_message('Layers created')
 
-    def _create_layer(self, id, features, incident_type):
+    def _create_layer(self, layer, features, incident_type, type):
         #create layer and add itemId to self._share_ids
 
-        layer_items = self._get_layer_features(id, features, incident_type)
+        if type == 'analysis':
+            layer_items = self._get_layer_features(layer, features, incident_type)
+        else:
+            layer_items = [layer]
 
-        url = self._user_url() + '/addItem'
+        url = self._user_url() + '/' + self.folder_id + '/addItem'
 
         for layer in layer_items:
-            ##TODO figure out how to deal with all this without over complicating the config
-            layer_definition = self._get_layer_definition(layer.name, None, None, layer.extent, 
-                                                          layer.geometryType, layer.objectIdField, layer.typeIdField, 
-                                                          layer.types, layer.drawingInfo, layer.fields, 
-                                                          layer.minScale, layer.maxScale, None, layer.graphics)
+            layer_definition = self._get_layer_definition(layer)
 
-            #add the new item to the folder
-            request_parameters = {
-                'f' : 'json', 
-                'token' : self._config_options['token'], 
-                'item': layer_definition
-                }
+            item = self._url_request(url, layer_definition, 'POST')
+            if item['success']:
+                self._share_ids.append(item['id'])
 
-            item = self._url_request(url, request_parameters)
-
-            self._share_ids.append(id)
-        
-        print('layer created')
-
-    def _get_layer_definition(self, name, tags, description, extent, geometryType, objectIdField, typeIdField, types, renderer, fields, minScale, maxScale, popupInfo, features):
+    def _get_layer_definition(self, layer):
         return {
-          'title': name,
+          'token' : self._config_options['token'],
+          'title': layer.name,
           'type': 'Feature Collection',
-          'tags': tags,
-          'description': description,
-          'extent': extent,
-          'name': name,
-          'text': {
+          'tags': 'Snapshot',
+          'description': None,
+          'extent': layer.extent,
+          'name': layer.name,
+          'text': json.dumps({
             'layers': [{
               'layerDefinition': {
-                'name': name,
-                'geometryType': geometryType,
-                'objectIdField': objectIdField,
-                'typeIdField': typeIdField,
-                'types': types,
+                'name': layer.name,
+                'geometryType': layer.geometryType,
+                'objectIdField': layer.objectIdField,
+                'typeIdField': layer.typeIdField,
+                'types': layer.types,
                 'type': 'Feature Layer',
-                'extent': extent,
-                'drawingInfo': {
-                  'renderer': renderer
-                },
-                'fields': fields,
-                'minScale': minScale,
-                'maxScale': maxScale
+                'extent': layer.extent,
+                'drawingInfo': layer.drawingInfo,
+                'fields': layer.fields,
+                'minScale': layer.minScale,
+                'maxScale': layer.maxScale
               },
-              'popupInfo': popupInfo,
+              'popupInfo': None,
               'featureSet': {
-                'features': features,
-                'geometryType': geometryType
+                'features': layer.graphics,
+                'geometryType': layer.geometryType
               }
             }]
-          },
+          }),
           'f': 'json'
         }
 
     def _get_incident_item(self):
-        if 'incident_service_url' in self._config_options:
+        # This will first check if an incidnet layer comes from the user defined webmap
+        # Next it will check if the service url has been provided directly 
+        # Finally it will check and fetch the layer by item id if that has been provided
+
+        #TODO update for failover...for example values are specified but layers don't exist in the map
+        if 'incident_layer_name' in self._config_options and 'webmap_id' in self._config_options:
+            webmap_layer = self._get_webmap_layer(self._config_options['incident_layer_name'])
+            url = webmap_layer['url']
+        elif 'incident_service_url' in self._config_options:
             url = self._config_options['incident_service_url']
         elif 'incident_service_id' in self._config_options and 'incident_layer_name' in self._config_options:
-            url = self.get_url_by_id(self._config_options['incident_service_id'], self._config_options['incident_layer_name'])
+            url = self._get_url_by_id(self._config_options['incident_service_id'], self._config_options['incident_layer_name'])
 
         request_parameters = {'f' : 'json', 'token' : self._config_options['token']}
 
@@ -382,19 +347,24 @@ class Snapshot:
         elif 'feature_ids' in self._config_options:
             request_parameters['objectids'] = self._config_options['feature_ids']
         else:
-            #need where or IDs
+            #need where or IDs...or does nothing indicate use-all features??
             raise
         request_parameters['fields'] = '*'
         item = self._url_request(url + '/query', request_parameters)
 
-        data = LayerData(item_info['name'] + self.time, item['features'], item_info['drawingInfo'], None, 
-                 item_info['fields'], "", item_info['description'], True,
-                 True, item_info['typeIdField'], item_info['types'], item_info['minScale'], item_info['maxScale'], item_info['geometryType'], 'incident')
+        data = LayerData(None, item_info, item, self.time, True, 'incident')
 
         self._layers.append(data)
         return data
 
-    def get_url_by_id(self, id, name):
+    def _get_webmap_layer(self, name):
+        #TODO this would only work for url based layers...would need to check with the ID for
+        # things like feature collections
+        for layer in self.webmap_layers:
+            if layer['title'] == name or layer['id'] == name:
+                return layer
+
+    def _get_url_by_id(self, id, name):
         url = self._items_url().format(id)
         request_parameters = {'f' : 'json', 'token' : self._config_options['token']}
         item = self._url_request(url, request_parameters, error_text='Unable to find item with ID: {}'.format(id))
@@ -413,56 +383,110 @@ class Snapshot:
         ##get oid field name and other layer props 
         return url + "/" + str(id)
 
-    def _get_layer_features(self, id, features, incident_type):
+    def _get_layer_features(self, layer, features, incident_type):
         ##TODO need to understand how to know when the geom will exceed what I can send in a request
-        if 'sub_layer_names' in self._config_options:
-            sub_layer_names = self._config_options['sub_layer_names']
 
-        layers = ['']
-        if sub_layer_names:
-            layers = sub_layer_names[id]
         items = []
-        for layer_name in layers:
-            url = self.get_url_by_id(id, layer_name)
+        url = layer['url']
 
-            request_parameters = {'f' : 'json', 'token' : self._config_options['token']}
-            item_info = self._url_request(url, request_parameters)
+        request_parameters = {'f' : 'json', 'token' : self._config_options['token']}
+        item_info = self._url_request(url, request_parameters)
 
-            ##TODO this does not work with multiple geoms...need to figure out the best way to deal with that
-            #create the geom query string
-            query_string = json.dumps(features[0]['geometry'])
+        ##TODO this does not work with multiple geoms...need to figure out the best way to deal with that
+        #create the geom query string
+        query_string = json.dumps(features[0]['geometry'])
 
-            request_parameters = {
-                'f' : 'json', 
-                'token' : self._config_options['token'],
-                'geometryType': incident_type,
-                'geometry': query_string
-                }
+        request_parameters = {
+            'f' : 'json', 
+            'token' : self._config_options['token'],
+            'geometryType': incident_type,
+            'geometry': query_string
+            }
 
-            item = self._url_request(url + "/query", request_parameters)
+        item = self._url_request(url + "/query", request_parameters)
 
-            data = LayerData(item_info['name'] + self.time, item['features'], item_info['drawingInfo'], None, 
-                 item_info['fields'], "", item_info['description'], True,
-                 True, item_info['typeIdField'], item_info['types'], item_info['minScale'], item_info['maxScale'], item_info['geometryType'], 'analysis')
+        
+        #webmap_layer, item_info, item, type, time, visibleOnStartup):
 
-            self._layers.append(data)
-            items.append(data)
+        data = LayerData(layer, item_info, item, self.time, False, 'analysis')
+
+        self._layers.append(data)
+        items.append(data)
 
         return items
 
-    def _create_map(self):
-        #create layer and add itemID to self._share_ids
+    def _get_analysis_layers(self):
+        # This will first check if an analysis layer comes from the user defined webmap
+        # Next it will check if the service url has been provided directly 
+        # Finally it will check and fetch the layer by item id if that has been provided
+        names = []
+        if 'layer_names' in self._config_options and 'webmap_id' in self._config_options and len(self._config_options['layer_names']) > 0:
+            names = self._config_options['layer_names']
+        elif 'layer_service_urls' in self._config_options and len(self._config_options['layer_service_urls']) > 0:
+            names = self._config_options['layer_service_urls']
+        elif 'layer_service_ids' in self._config_options and 'layer_service_ids' in self._config_options and len(self._config_options['layer_service_ids']) > 0:
+            names = self._get_url_by_id(self._config_options['layer_service_ids'], self._config_options['layer_service_ids'])
+             
+        layers = []
+        for name in names:
+            webmap_layer = self._get_webmap_layer(name)
+            layers.append(webmap_layer)
 
-        #REST API call
+        if len(layers) > 0:
+            return layers
+        else:
+            #need one or more analysis layers
+            raise
+
+    def _create_map(self):
+        url = self._user_url() + '/' + self.folder_id + '/addItem'
+        map_definition = self._get_map_definition()
+        item = self._url_request(url, map_definition, 'POST')
+        if item['success']:
+            self._share_ids.append(item['id'])
 
         self._share_ids.append(id)
 
         print('map created')
 
-    def _add_layers_to_map(self):
-        #add new layers to new map definition
+    def _get_map_definition(self):
+        basemap_layers = self.web_map['baseMap']['baseMapLayers']
+        spatial_reference = self.web_map['baseMap']['spatialReference']
+        _basemap_layers = []
+        """
+        for basemap_layer in basemap_layers:
+            _basemap_layers.append({"id": basemap_layer.id,
+                                    "layerType": basemap_layer.layerType, 
+                                    "url": basemap_layer.url,
+                                    "visibility": basemap_layer.visibility,
+                                    "opacity": basemap_layer.opacity,
+                                    "title": basemap_layer.title
+                                    })
+                                    """
+        base_map = {"baseMapLayers": basemap_layers}
 
-        print('layers added to map')
+        operational_layers = []
+        for operational_layer in self._layers:
+            operational_layers.append({"id": operational_layer.id, 
+                                       "layerType": "ArcGISFeatureLayer", 
+                                       "visibility": operational_layer.visible, 
+                                       "opacity": operational_layer.opacity, 
+                                       "title": operational_layer.label, 
+                                       "type": "Feature Collection", 
+                                       "itemId": operational_layer.itemId
+                                       })
+        return {"title": title,
+                "type": "Web Map",
+                "item": title,
+                "extent": ext1.xmin + "," + ext1.ymin + "," + ext1.xmax + "," + ext1.ymax,
+                "text": json.dumps({"operationalLayers": operational_layers,
+                                    "baseMap": base_map,
+                                    "spatialReference": spatial_reference,
+                                    "version": "2.4"
+                                    }),
+                "tags": "Snapshot",
+                "wabType": "HTML"
+                }
 
     def _share_items(self, share_options):
         #share items per user definition
@@ -511,8 +535,7 @@ class Snapshot:
 
         self._start_logging()
 
-        #self._config_options['feature_service_id'] = _validate_input(config, 'Existing ItemIDs', 'featureServiceItemID', 'id', True)
-
+        #Folder config options
         folder_name = _validate_input(config, 'Folder', 'folder_name', 'string', True)
         if folder_name is not None:
             self._config_options['folder_name'] = folder_name
@@ -521,10 +544,7 @@ class Snapshot:
         if folder_description is not None:
             self._config_options['folder_description'] = folder_description
         
-        #fgdb = _validate_input(config, 'Data Sources', 'fgdb', 'path', False)
-        #if fgdb is not None:
-            #self._config_options['fgdb'] = fgdb
-        
+        #Portal config options
         self._config_options['org_url'] = _validate_input(config, 'Portal', 'org_url', 'url', True)
         self._config_options['username'] = _validate_input(config, 'Portal', 'username', 'string', True)
         self._config_options['pw'] = _validate_input(config, 'Portal', 'pw', 'string', True)
@@ -533,6 +553,7 @@ class Snapshot:
         if token_url is not None:
             self._config_options['token_url'] = token_url
 
+        #Incident config options
         incident_service_id = _validate_input(config, 'Incident', 'incident_service_id', 'string', False)
         if incident_service_id is not None:
             self._config_options['incident_service_id'] = incident_service_id
@@ -549,6 +570,7 @@ class Snapshot:
         if incident_layer_name is not None:
             self._config_options['incident_layer_name'] = incident_layer_name
 
+        #Layers config options
         sub_layer_names = _validate_input(config, 'Layers', 'sub_layer_names', 'dict', False)
         if sub_layer_names is not None:
             self._config_options['sub_layer_names'] = sub_layer_names
@@ -556,7 +578,36 @@ class Snapshot:
         layer_service_ids = _validate_input(config, 'Layers', 'layer_service_ids', 'string', False)
         if layer_service_ids is not None:
             self._config_options['layer_service_ids'] = layer_service_ids
-        
+
+        layer_service_urls = _validate_input(config, 'Layers', 'layer_service_urls', 'list', False)
+        if layer_service_urls is not None:
+            self._config_options['layer_service_urls'] = layer_service_urls
+
+        #WebMap config options
+        webmap_id = _validate_input(config, 'WebMap', 'webmap_id', 'string', False)
+        if webmap_id is not None:
+            self._config_options['webmap_id'] = webmap_id
+
+            incident_layer_name = _validate_input(config, 'WebMap', 'incident_layer_name', 'string', False)
+            if incident_layer_name is not None:
+                self._config_options['incident_layer_name'] = incident_layer_name
+
+            layer_names = _validate_input(config, 'WebMap', 'layer_names', 'list', False)
+            if layer_names is not None:
+                self._config_options['layer_names'] = layer_names
+
+        #Share config options
+        share_everyone = _validate_input(config, 'Share', 'share_everyone', 'string', False)
+        if share_everyone is not None:
+            self._config_options['share_everyone'] = share_everyone
+
+        share_org = _validate_input(config, 'Share', 'share_org', 'string', False)
+        if share_org is not None:
+            self._config_options['share_org'] = share_org
+
+        share_groups = _validate_input(config, 'Share', 'share_groups', 'string', False)
+        if share_groups is not None:
+            self._config_options['share_groups'] = share_groups
 
     def _start_logging(self):
         """If a log file is specified in the config,
@@ -701,36 +752,6 @@ class Snapshot:
                 break
             time.sleep(2)
 
-    def _get_published_items(self):
-        """Validates the feature service and feature collection exist and sets global variables."""
-        url = '{0}sharing/rest/content/items/{1}'.format(self._config_options['org_url'], self._config_options['feature_service_id'])
-        request_parameters = {'f' : 'json', 'token' : self._config_options['token']}
-        item = self._url_request(url, request_parameters, error_text='Unable to find feature service with ID: {}'.format(self._config_options['feature_service_id']))
-
-        if not item['type'] == 'Feature Service':
-            raise Exception("Item {} is not a feature service".format(self._config_options['feature_service_id'])) 
-
-        self._config_options['basename'] = item['title']
-
-        if 'feature_collection_id' in self._config_options:
-            url = '{0}sharing/rest/content/items/{1}'.format(self._config_options['org_url'], self._config_options['feature_collection_id'])
-            item = self._url_request(url, request_parameters, error_text='Unable to find feature collection with ID: {}'.format(self._config_options['feature_collection_id']))
-
-            if not item['type'] == 'Feature Collection':
-                raise Exception("Item {} is not a feature collection".format(self._config_options['feature_collection_id'])) 
-
-            self._config_options['temp_fc_name'] = item['title'] + "_temp"
-            self._config_options['owner_folder'] = item['ownerFolder']
-
-    def _delete_item(self, item_id):
-        """Delete an item from the portal with a given id.
-
-        Keyword arguments:
-        item_id - the id of the item to delete"""
-        url = '{0}sharing/rest/content/users/{1}/items/{2}/delete'.format(self._config_options['org_url'], self._config_options['username'], item_id)
-        request_parameters = {'f' : 'json', 'token' : self._config_options['token']}
-        return self._url_request(url, request_parameters, 'POST', repeat=2, raise_on_failure=False)
-
 def _validate_input(config, group, name, variable_type, required):
     """Validates and returns the correspoinding value defined in the config.
 
@@ -754,6 +775,8 @@ def _validate_input(config, group, name, variable_type, required):
             return value.lower() == 'true'
         elif variable_type == 'dict':
             return json.loads(value)
+        elif variable_type == 'list':
+            return list(value.split(','))
         else:
             return value
     except (configparser.NoSectionError, configparser.NoOptionError):
@@ -763,7 +786,6 @@ def _validate_input(config, group, name, variable_type, required):
             return False
         else:
             return None
-
 
 def run(config_file=None):
     """Create Snapshot."""
