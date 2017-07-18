@@ -171,6 +171,8 @@ class LayerData(object):
         self.maxScale = item_info['maxScale']
         self.geometryType = item_info['geometryType']
         self.extent = item_info['extent']
+        ##TODO ensure this is the best spot to check
+        self.spatialReference = self.extent['spatialReference']
 
         self.infoTemplate = None
         self.tags = None
@@ -246,6 +248,12 @@ class Snapshot:
         self.web_map['itemId'] = id
         self.webmap_layers = item['operationalLayers']
 
+        url = self._items_url.format(id)
+        _item = self._url_request(url, request_parameters, error_text='Unable to find item with ID: {}'.format(id))
+        ##TODO make sure this is ok...may want to have some backup or even support an option config option to support the extent
+        ## other option would be to support based on the inccident and analysis feature geoms but would need to calculate the extanet from multiple geoms and geom types
+        self.extent = _item['extent']
+
     def _create_folder(self):
         """create folder and add itemID to self._share_ids"""
         self._log_message('Creating Folder: ' + self._config_options['folder_name'] + "_" + self.time)
@@ -299,6 +307,9 @@ class Snapshot:
             item = self._url_request(url, layer_definition, 'POST')
             if item['success']:
                 self._share_ids.append(item['id'])
+            for l in self._layers:
+                if l.itemId == layer.itemId:
+                    l.newItemId = item['id']
 
     def _get_layer_definition(self, layer):
         """Basic layer definition"""
@@ -313,7 +324,54 @@ class Snapshot:
                            'domain': field['domain']
                            })
 
+        # need to verify that geom has SR and features have sequential OIDs
+        features = []
+        ##################################################################
         #break apart multi-part features and update attributes accordingly
+        #Feature Collections do not support multi-part
+        i = 0
+        for g in layer.graphics:
+            _parts = []
+            gt = ''
+            if 'geometry' in g:
+                geom = g['geometry']
+                if 'paths' in geom:
+                    _parts = geom['paths']
+                    gt = 'line'
+                elif 'rings' in geom:
+                    _parts = geom['rings']
+                    gt = 'poly'
+                else:
+                    _parts = [geom]
+                    gt = 'point'
+            _i = 0
+            newGeom = None
+            for p in _parts:
+                # in JS construct a new Geom object here...don't really want to pull in an API just for that...looking at options
+                newGeom = {}
+                if gt == 'line':
+                    newGeom['paths'] = [p]
+                elif gt == 'poly':
+                    newGeom['rings'] = [p]
+                elif gt == 'point':
+                    newGeom = p
+                newGeom['spatialReference'] = layer.spatialReference
+                f = {
+                    'attributes': {
+                        layer.objectIdField: i + _i,
+                        'Snapshot': self.time
+                    },
+                    'geometry': newGeom
+                }
+                if len(layer.fields) > 0:
+                    for field in layer.fields:
+ 
+                        if field['name'] in g['attributes']:
+                            f['attributes'][field['name']] = g['attributes'][field['name']]
+                features.append(f);
+                _i += 1
+            i += 1
+        ##################################################################
 
         #not sure if this is necessary but being done in JS
         g = layer.graphics[0]
@@ -353,7 +411,7 @@ class Snapshot:
               },
               'popupInfo': None,
               'featureSet': {
-                'features': layer.graphics,
+                'features': features,
                 'geometryType': layer.geometryType
               }
             }]
@@ -488,18 +546,7 @@ class Snapshot:
     def _get_map_definition(self):
         basemap_layers = self.web_map['baseMap']['baseMapLayers']
         spatial_reference = self.web_map['spatialReference']
-        _basemap_layers = []
-        
-        #for basemap_layer in basemap_layers:
-        #    _basemap_layers.append({"id": basemap_layer['id'],
-       #                             "layerType": basemap_layer['layerType'], 
-        #                            "url": basemap_layer['url'],
-       #                             "visibility": basemap_layer['visibility'],
-        #                            "opacity": basemap_layer['opacity'],
-       #                             "title": basemap_layer['title']
-        #                            })
-        #base_map = {"baseMapLayers": _basemap_layers}
-            
+        _basemap_layers = []            
         base_map = {"baseMapLayers": basemap_layers}
 
         operational_layers = []
@@ -510,12 +557,12 @@ class Snapshot:
                                        "opacity": operational_layer.opacity, 
                                        "title": operational_layer.name, 
                                        "type": "Feature Collection", 
-                                       "itemId": operational_layer.itemId
+                                       "itemId": operational_layer.newItemId
                                        })
         return {"title": 'title',
                 "type": "Web Map",
                 "item": 'title',
-                "extent": json.dumps(self._layers[0].extent),# str(self._layers[0].extent['xmin']) + "," + str(self._layers[0].extent['ymin']) + "," + str(self._layers[0].extent['xmax']) + "," + str(self._layers[0].extent['ymax']),
+                "extent": self.extent, #str(self._layers[0].extent['xmin']) + "," + str(self._layers[0].extent['ymin']) + "," + str(self._layers[0].extent['xmax']) + "," + str(self._layers[0].extent['ymax']),
                 "text": json.dumps({"operationalLayers": operational_layers,
                                     "baseMap": base_map,
                                     "spatialReference": spatial_reference,
